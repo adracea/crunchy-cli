@@ -3,7 +3,7 @@ use crate::cli::utils::{download_cc, download_segments, find_resolution, FFmpegP
 use crate::utils::context::Context;
 use crate::utils::format::{format_string, Format};
 use crate::utils::log::progress;
-use crate::utils::os::{free_file, has_ffmpeg};
+use crate::utils::os::{free_file, has_ffmpeg, is_special_file};
 use crate::utils::parse::{parse_url, UrlFilter};
 use crate::utils::sort::{sort_formats_after_seasons, sort_seasons_after_number};
 use crate::Execute;
@@ -110,6 +110,9 @@ impl Execute for Download {
         if self.ffmpeg_preset.len() == 1
             && self.ffmpeg_preset.get(0).unwrap() == &FFmpegPreset::Nvidia
         {
+        if self.ffmpeg_preset.len() == 1
+            && self.ffmpeg_preset.get(0).unwrap() == &FFmpegPreset::Nvidia
+        {
             warn!("Skipping 'nvidia' hardware acceleration preset since no other codec preset was specified")
         }
 
@@ -120,18 +123,18 @@ impl Execute for Download {
         let mut parsed_urls = vec![];
 
         for (i, url) in self.urls.iter().enumerate() {
-            let _progress_handler = progress!("Parsing url {}", i + 1);
+            let progress_handler = progress!("Parsing url {}", i + 1);
             match parse_url(&ctx.crunchy, url.clone(), true).await {
                 Ok((media_collection, url_filter)) => {
                     parsed_urls.push((media_collection, url_filter));
-                    info!("Parsed url {}", i + 1)
+                    progress_handler.stop(format!("Parsed url {}", i + 1))
                 }
                 Err(e) => bail!("url {} could not be parsed: {}", url, e),
             }
         }
         let mut ep_collection: Option<Vec<Media<crunchyroll_rs::Episode>>> = None;
         for (i, (media_collection, url_filter)) in parsed_urls.into_iter().enumerate() {
-            let _progress_handler = progress!("Fetching series details");
+            let progress_handler = progress!("Fetching series details");
             let formats = match media_collection {
                 MediaCollection::Series(series) => {
                     debug!("Url {} is series ({})", i + 1, series.title);
@@ -200,11 +203,10 @@ impl Execute for Download {
             };
 
             let Some(formats) = formats else {
-                info!("Skipping url {} (no matching episodes found)", i + 1);
+                progress_handler.stop(format!("Skipping url {} (no matching episodes found)", i + 1));
                 continue;
             };
-            info!("Loaded series information for url {}", i + 1);
-            drop(_progress_handler);
+            progress_handler.stop(format!("Loaded series information for url {}", i + 1));
 
             if log::max_level() == log::Level::Debug {
                 let seasons = sort_formats_after_seasons(formats.clone());
@@ -282,7 +284,11 @@ impl Execute for Download {
                 tab_info!(
                     "Downloading {} to '{}'",
                     format.title,
-                    path.file_name().unwrap().to_str().unwrap()
+                    if is_special_file(&path) {
+                        path.to_str().unwrap()
+                    } else {
+                        path.file_name().unwrap().to_str().unwrap()
+                    }
                 );
                 tab_info!("Episode: S{:02}E{:02}", format.season_number, format.number);
                 tab_info!("Audio: {}", format.audio);
@@ -306,14 +312,22 @@ impl Execute for Download {
                         continue;
                     }
                 }
-                if path.extension().unwrap_or_default().to_string_lossy() != "ts"
-                    || !self.ffmpeg_preset.is_empty()
+                let extension = path.extension().unwrap_or_default().to_string_lossy();
+
+                if (!extension.is_empty() && extension != "ts"
+                   ) || !self.ffmpeg_preset.is_empty()
                 {
                     download_ffmpeg(&ctx, &self, format.stream, path.as_path()).await?;
                 } else if path.to_str().unwrap() == "-" {
                     let mut stdout = std::io::stdout().lock();
                     download_segments(&ctx, &mut stdout, None, format.stream).await?;
                 } else {
+                    // create parent directory if it does not exist
+                    if let Some(parent) = path.parent() {
+                        if !parent.exists() {
+                            std::fs::create_dir_all(parent)?
+                        }
+                    }
                     let mut file = File::options().create(true).write(true).open(&path)?;
                     download_segments(&ctx, &mut file, None, format.stream).await?
                 }
@@ -333,6 +347,13 @@ async fn download_ffmpeg(
     let (input_presets, output_presets) =
         FFmpegPreset::ffmpeg_presets(download.ffmpeg_preset.clone())?;
 
+    // create parent directory if it does not exist
+    if let Some(parent) = target.parent() {
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)?
+        }
+    }
+
     let mut ffmpeg = Command::new("ffmpeg")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -340,6 +361,19 @@ async fn download_ffmpeg(
         .arg("-y")
         .args(input_presets)
         .args(["-f", "mpegts", "-i", "pipe:"])
+        .args(
+            if target
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .is_empty()
+            {
+                vec!["-f", "mpegts"]
+            } else {
+                vec![]
+            }
+            .as_slice(),
+        )
         .args(output_presets)
         .arg(target.to_str().unwrap())
         .spawn()?;
