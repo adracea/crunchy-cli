@@ -2,6 +2,7 @@ use crate::utils::context::Context;
 use anyhow::{bail, Result};
 use crunchyroll_rs::media::{Resolution, VariantData, VariantSegment};
 use log::{debug, LevelFilter};
+use rsubs_lib::vtt;
 use std::borrow::{Borrow, BorrowMut};
 use std::collections::BTreeMap;
 use std::io;
@@ -22,6 +23,13 @@ pub fn find_resolution(
             .into_iter()
             .find(|v| resolution.height == u64::MAX || v.resolution.height == resolution.height),
     }
+}
+
+pub async fn download_cc(ctx: &Context, path: String, ccurl: String) -> Result<()> {
+    let client = Arc::new(ctx.crunchy.client());
+    let data = vtt::parse(client.get(ccurl).send().await?.text().await?).to_ass();
+    data.to_file(path)?;
+    Ok(())
 }
 
 pub async fn download_segments(
@@ -131,9 +139,55 @@ pub async fn download_segments(
         let thread_count = count.clone();
         join_set.spawn(async move {
             for (i, segment) in thread_segments.into_iter().enumerate() {
-                let response = thread_client.get(&segment.url).send().await?;
-                let mut buf = response.bytes().await?.to_vec();
-
+                let response_res = thread_client
+                    .get(&segment.url)
+                    .timeout(Duration::from_secs(30u64))
+                    .send()
+                    .await;
+                let verfified_response = match response_res {
+                    Ok(x) => x,
+                    Err(y) => panic!("This is likely a netowrking error: {}", y),
+                };
+                let possible_error_in_response = verfified_response.bytes().await;
+                let mut buf = if let Ok(r) = possible_error_in_response {
+                    r.to_vec()
+                } else {
+                    debug!(
+                        "Segment Failed to download: {}, retrying.",
+                        num + (i * cpus)
+                    );
+                    let mut resp = thread_client
+                        .get(&segment.url)
+                        .timeout(Duration::from_secs(30u64))
+                        .send()
+                        .await
+                        .unwrap()
+                        .bytes()
+                        .await;
+                    if resp.is_err() {
+                        let mut retry_ctr = 1;
+                        loop {
+                            debug!(
+                                "Segment Failed to download: {}, retry {}.",
+                                num + (i * cpus),
+                                retry_ctr
+                            );
+                            resp = thread_client
+                                .get(&segment.url)
+                                .timeout(Duration::from_secs(30u64))
+                                .send()
+                                .await
+                                .unwrap()
+                                .bytes()
+                                .await;
+                            if resp.is_ok() {
+                                break;
+                            }
+                            retry_ctr += 1;
+                        }
+                    }
+                    resp.unwrap().to_vec()
+                };
                 *thread_amount.lock().unwrap() += buf.len();
 
                 buf = VariantSegment::decrypt(buf.borrow_mut(), segment.key)?.to_vec();
@@ -142,7 +196,7 @@ pub async fn download_segments(
                     num + (i * cpus),
                     segment.url
                 );
-                thread_sender.send((num + (i * cpus), buf))?;
+                thread_sender.send((num + (i * cpus), buf)).unwrap();
 
                 *thread_count.lock().unwrap() += 1;
             }
@@ -151,12 +205,10 @@ pub async fn download_segments(
         });
     }
 
+    drop(sender);
     let mut data_pos = 0usize;
     let mut buf: BTreeMap<usize, Vec<u8>> = BTreeMap::new();
-    loop {
-        // is always `Some` because `sender` does not get dropped when all threads are finished
-        let data = receiver.recv().unwrap();
-
+    for data in receiver.iter() {
         if data_pos == data.0 {
             writer.write_all(data.1.borrow())?;
             data_pos += 1;
@@ -167,10 +219,7 @@ pub async fn download_segments(
             writer.write_all(b.borrow())?;
             data_pos += 1;
         }
-
-        if *count.lock().unwrap() >= total_segments && buf.is_empty() {
-            break;
-        }
+        debug!("Buf is {:?} TL is {:?}", buf.len(), *count.lock().unwrap());
     }
 
     while let Some(joined) = join_set.join_next().await {
@@ -200,7 +249,7 @@ impl ToString for FFmpegPreset {
             &FFmpegPreset::H265 => "h265",
             &FFmpegPreset::H264 => "h264",
         }
-            .to_string()
+        .to_string()
     }
 }
 
@@ -233,7 +282,9 @@ impl FFmpegPreset {
         })
     }
 
-    pub(crate) fn ffmpeg_presets(mut presets: Vec<FFmpegPreset>) -> Result<(Vec<String>, Vec<String>)> {
+    pub(crate) fn ffmpeg_presets(
+        mut presets: Vec<FFmpegPreset>,
+    ) -> Result<(Vec<String>, Vec<String>)> {
         fn preset_check_remove(presets: &mut Vec<FFmpegPreset>, preset: FFmpegPreset) -> bool {
             if let Some(i) = presets.iter().position(|p| p == &preset) {
                 presets.remove(i);

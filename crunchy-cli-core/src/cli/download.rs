@@ -1,5 +1,5 @@
 use crate::cli::log::tab_info;
-use crate::cli::utils::{download_segments, FFmpegPreset, find_resolution};
+use crate::cli::utils::{download_cc, download_segments, find_resolution, FFmpegPreset};
 use crate::utils::context::Context;
 use crate::utils::format::{format_string, Format};
 use crate::utils::log::progress;
@@ -32,6 +32,11 @@ pub struct Download {
     Available languages are: {}", Locale::all().into_iter().map(|l| l.to_string()).collect::<Vec<String>>().join(", ")))]
     #[arg(short, long)]
     subtitle: Option<Locale>,
+    #[arg(help = format!("Closed Caption language. Available languages are: {}", Locale::all().into_iter().map(|l| l.to_string()).collect::<Vec<String>>().join(", ")))]
+    #[arg(long_help = format!("Closed Caption language. If set, the cc will be burned into the video and cannot be disabled. \
+    Available languages are: {}", Locale::all().into_iter().map(|l| l.to_string()).collect::<Vec<String>>().join(", ")))]
+    #[arg(short, long)]
+    closedcaption: Option<Locale>,
 
     #[arg(help = "Name of the output file")]
     #[arg(long_help = "Name of the output file.\
@@ -70,6 +75,16 @@ pub struct Download {
     #[arg(long)]
     #[arg(value_parser = FFmpegPreset::parse)]
     ffmpeg_preset: Vec<FFmpegPreset>,
+    #[arg(help = format!("Specify a season id if known."))]
+    #[arg(long_help = format!("Specify a season ID if known, those usually look similar to episode or series IDs. \
+    Example: \
+    GRZXCMJKG - Chainsaw Man English Dub Season 1"))]
+    #[arg(long)]
+    seasonid: Option<String>,
+    #[arg(help = format!("Specify video skip and only get CC."))]
+    #[arg(long_help = format!("Specify wether to download only the subtitles or not."))]
+    #[arg(long)]
+    subs_only: Option<bool>,
 
     #[arg(help = "Url(s) to Crunchyroll episodes or series")]
     urls: Vec<String>,
@@ -92,7 +107,9 @@ impl Execute for Download {
         }
 
         let _ = FFmpegPreset::ffmpeg_presets(self.ffmpeg_preset.clone())?;
-        if self.ffmpeg_preset.len() == 1 && self.ffmpeg_preset.get(0).unwrap() == &FFmpegPreset::Nvidia {
+        if self.ffmpeg_preset.len() == 1
+            && self.ffmpeg_preset.get(0).unwrap() == &FFmpegPreset::Nvidia
+        {
             warn!("Skipping 'nvidia' hardware acceleration preset since no other codec preset was specified")
         }
 
@@ -112,12 +129,36 @@ impl Execute for Download {
                 Err(e) => bail!("url {} could not be parsed: {}", url, e),
             }
         }
-
+        let mut ep_collection: Option<Vec<Media<crunchyroll_rs::Episode>>> = None;
         for (i, (media_collection, url_filter)) in parsed_urls.into_iter().enumerate() {
             let _progress_handler = progress!("Fetching series details");
             let formats = match media_collection {
                 MediaCollection::Series(series) => {
                     debug!("Url {} is series ({})", i + 1, series.title);
+
+                    let test = series.seasons().await?;
+                    for seas in test {
+                        if url_filter.is_season_valid(seas.metadata.season_number) {
+                            if self.closedcaption.clone().is_some() {
+                                if seas
+                                    .metadata
+                                    .subtitle_locales
+                                    .contains(&self.closedcaption.clone().unwrap())
+                                {
+                                    ep_collection = Some(seas.episodes().await?);
+                                } else {
+                                    info!(
+                                        "Series {}, Season {} ID: {} Audio: {:?}, Subs: {:?}",
+                                        series.title,
+                                        seas.title,
+                                        seas.id,
+                                        seas.metadata.audio_locales,
+                                        seas.metadata.subtitle_locales
+                                    );
+                                }
+                            }
+                        }
+                    }
                     formats_from_series(&self, series, &url_filter).await?
                 }
                 MediaCollection::Season(season) => {
@@ -127,6 +168,7 @@ impl Execute for Download {
                         season.metadata.season_number,
                         season.title
                     );
+                    ep_collection = Some(season.episodes().await?);
                     formats_from_season(&self, season, &url_filter).await?
                 }
                 MediaCollection::Episode(episode) => {
@@ -137,8 +179,10 @@ impl Execute for Download {
                         episode.title,
                         episode.metadata.season_number,
                         episode.metadata.season_title,
-                        episode.metadata.series_title
+                        episode.metadata.series_title,
                     );
+
+                    ep_collection = Some(vec![episode.clone()]);
                     format_from_episode(&self, episode, &url_filter, false)
                         .await?
                         .map(|fmt| vec![fmt])
@@ -215,7 +259,27 @@ impl Execute for Download {
                     )),
                 );
 
-                info!(
+                if self.closedcaption.is_some() && ep_collection.is_some() {
+                    let ccpath: &mut PathBuf = &mut path.clone();
+                    ccpath.set_extension("ass");
+                    let ep = ep_collection
+                        .clone()
+                        .unwrap()
+                        .remove(format.number as usize - 1);
+                    download_cc(
+                        &ctx,
+                        ccpath.to_str().unwrap().to_string(),
+                        ep.streams()
+                            .await?
+                            .closed_captions
+                            .get(&self.closedcaption.as_ref().unwrap())
+                            .unwrap()
+                            .url
+                            .to_string(),
+                    )
+                    .await?;
+                };
+                tab_info!(
                     "Downloading {} to '{}'",
                     format.title,
                     path.file_name().unwrap().to_str().unwrap()
@@ -228,10 +292,23 @@ impl Execute for Download {
                         .clone()
                         .map_or("None".to_string(), |l| l.to_string())
                 );
+                tab_info!(
+                    "Closed Captions: {}",
+                    self.closedcaption
+                        .clone()
+                        .map_or("None".to_string(), |l| l.to_string())
+                );
                 tab_info!("Resolution: {}", format.stream.resolution);
                 tab_info!("FPS: {:.2}", format.stream.fps);
-
-                if path.extension().unwrap_or_default().to_string_lossy() != "ts" || !self.ffmpeg_preset.is_empty() {
+                if self.subs_only.is_some() {
+                    if self.subs_only.unwrap() {
+                        tab_info!("Skipping video");
+                        continue;
+                    }
+                }
+                if path.extension().unwrap_or_default().to_string_lossy() != "ts"
+                    || !self.ffmpeg_preset.is_empty()
+                {
                     download_ffmpeg(&ctx, &self, format.stream, path.as_path()).await?;
                 } else if path.to_str().unwrap() == "-" {
                     let mut stdout = std::io::stdout().lock();
@@ -247,7 +324,12 @@ impl Execute for Download {
     }
 }
 
-async fn download_ffmpeg(ctx: &Context, download: &Download, variant_data: VariantData, target: &Path) -> Result<()> {
+async fn download_ffmpeg(
+    ctx: &Context,
+    download: &Download,
+    variant_data: VariantData,
+    target: &Path,
+) -> Result<()> {
     let (input_presets, output_presets) =
         FFmpegPreset::ffmpeg_presets(download.ffmpeg_preset.clone())?;
 
@@ -285,31 +367,32 @@ async fn formats_from_series(
         );
         return Ok(None);
     }
-
     let mut seasons = series.seasons().await?;
+    if download.seasonid.is_some() {
+        seasons.retain(|s| s.id == download.seasonid.clone().unwrap())
+    } else {
+        // filter any season out which does not contain the specified audio language
+        for season in sort_seasons_after_number(seasons.clone()) {
+            // check if the current iterated season has the specified audio language
+            if !season
+                .iter()
+                .any(|s| s.metadata.audio_locales.contains(&download.audio))
+            {
+                error!(
+                    "Season {} of series {} is not available with {} audio",
+                    season.first().unwrap().metadata.season_number,
+                    series.title,
+                    download.audio
+                );
+            }
 
-    // filter any season out which does not contain the specified audio language
-    for season in sort_seasons_after_number(seasons.clone()) {
-        // check if the current iterated season has the specified audio language
-        if !season
-            .iter()
-            .any(|s| s.metadata.audio_locales.contains(&download.audio))
-        {
-            error!(
-                "Season {} of series {} is not available with {} audio",
-                season.first().unwrap().metadata.season_number,
-                series.title,
-                download.audio
-            );
+            // remove all seasons with the wrong audio for the current iterated season number
+            seasons.retain(|s| {
+                s.metadata.season_number != season.first().unwrap().metadata.season_number
+                    || s.metadata.audio_locales.contains(&download.audio)
+            })
         }
-
-        // remove all seasons with the wrong audio for the current iterated season number
-        seasons.retain(|s| {
-            s.metadata.season_number != season.first().unwrap().metadata.season_number
-                || s.metadata.audio_locales.contains(&download.audio)
-        })
     }
-
     let mut formats = vec![];
     for season in seasons {
         if let Some(fmts) = formats_from_season(download, season, url_filter).await? {
@@ -385,6 +468,25 @@ async fn format_from_episode(
             return Ok(None);
         }
         streams.hls_streaming_data(Some(subtitle.clone())).await?
+    } else if let Some(subtitle) = &download.closedcaption {
+        if !streams
+            .closed_captions
+            .keys()
+            .cloned()
+            .any(|x| &x == subtitle)
+        {
+            error!(
+                "Episode {} ({}) of season {} ({}) of {} has no {} closed captions",
+                episode.metadata.episode_number,
+                episode.title,
+                episode.metadata.season_number,
+                episode.metadata.season_title,
+                episode.metadata.series_title,
+                subtitle
+            );
+            return Ok(None);
+        }
+        streams.hls_streaming_data(None).await?
     } else {
         streams.hls_streaming_data(None).await?
     };
