@@ -110,9 +110,6 @@ impl Execute for Download {
         if self.ffmpeg_preset.len() == 1
             && self.ffmpeg_preset.get(0).unwrap() == &FFmpegPreset::Nvidia
         {
-        if self.ffmpeg_preset.len() == 1
-            && self.ffmpeg_preset.get(0).unwrap() == &FFmpegPreset::Nvidia
-        {
             warn!("Skipping 'nvidia' hardware acceleration preset since no other codec preset was specified")
         }
 
@@ -148,6 +145,14 @@ impl Execute for Download {
                                     .subtitle_locales
                                     .contains(&self.closedcaption.clone().unwrap())
                                 {
+                                    info!(
+                                        "Series {}, Season {} ID: {} Audio: {:?}, Subs: {:?}",
+                                        series.title,
+                                        seas.title,
+                                        seas.id,
+                                        seas.metadata.audio_locales,
+                                        seas.metadata.subtitle_locales
+                                    );
                                     ep_collection = Some(seas.episodes().await?);
                                 } else {
                                     info!(
@@ -212,7 +217,12 @@ impl Execute for Download {
                 let seasons = sort_formats_after_seasons(formats.clone());
                 debug!("Series has {} seasons", seasons.len());
                 for (i, season) in seasons.into_iter().enumerate() {
-                    info!("Season {} ({})", i + 1, season.get(0).unwrap().season_title);
+                    info!(
+                        "Season {} ({})[{}]",
+                        i + 1,
+                        season.get(0).unwrap().season_title,
+                        season.get(0).unwrap().season_id
+                    );
                     for format in season {
                         info!(
                             "{}: {}px, {:.02} FPS (S{:02}E{:02})",
@@ -228,8 +238,8 @@ impl Execute for Download {
                 for season in sort_formats_after_seasons(formats.clone()) {
                     let first = season.get(0).unwrap();
                     info!(
-                        "{} Season {} ({})",
-                        first.series_name, first.season_number, first.season_title
+                        "{} Season {} ({})[{}]",
+                        first.series_name, first.season_number, first.season_title, first.season_id
                     );
 
                     for (i, format) in season.into_iter().enumerate() {
@@ -314,9 +324,7 @@ impl Execute for Download {
                 }
                 let extension = path.extension().unwrap_or_default().to_string_lossy();
 
-                if (!extension.is_empty() && extension != "ts"
-                   ) || !self.ffmpeg_preset.is_empty()
-                {
+                if (!extension.is_empty() && extension != "ts") || !self.ffmpeg_preset.is_empty() {
                     download_ffmpeg(&ctx, &self, format.stream, path.as_path()).await?;
                 } else if path.to_str().unwrap() == "-" {
                     let mut stdout = std::io::stdout().lock();
